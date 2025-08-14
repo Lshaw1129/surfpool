@@ -1,0 +1,36 @@
+name: Run Surfpool Tests
+
+on:
+  workflow_dispatch:  # allow manual trigger
+  push:
+    branches: [ main ]
+
+jobs:
+  test-surfpool:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Build Surfpool
+        run: cargo build --release
+
+      - name: Run Replay Tests
+        run: |
+          ./target/release/surfpool replay \
+            --start 2025-07-01 \
+            --end 2025-07-31 \
+            --signature-source jupiter \
+            --output results.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: surfpool-test-results
+          path: results.json
