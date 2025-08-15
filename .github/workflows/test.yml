@@ -47,13 +47,15 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run backtest (fetch → filter via Jupiter → PnL)
+       
+     - name: Run backtest (fetch → filter via Jupiter → PnL)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p data out
 
-          node - <<'JS'
+          # Write the Node script to a file (avoids heredoc/YAML quoting issues)
+          cat > run_backtest.js <<'JS'
           const fs = require('fs');
           const https = require('https');
           const { URL } = require('url');
@@ -65,19 +67,19 @@ jobs:
           const END   = Math.floor(new Date(process.env.JULY_END_UTC).getTime()/1000);
 
           const F = {
-            MIN_MCAP: +process.env.MIN_MARKET_CAP,
-            MAX_MCAP: +process.env.MAX_MARKET_CAP,
-            MIN_LIQ:  +process.env.MIN_LIQUIDITY,
-            MAX_LIQ:  +process.env.MAX_LIQUIDITY,
-            MIN_VOL:  +process.env.MIN_VOLUME,
-            MAX_VOL:  +process.env.MAX_VOLUME,
-            SLIP_BPS: +process.env.SLIPPAGE_BPS,
-            TP: +process.env.TAKE_PROFIT_PCT,
-            SL: +process.env.STOP_LOSS_PCT,
-            NOTIONAL: +process.env.TRADE_SIZE_USD,
+            MIN_MCAP: Number(process.env.MIN_MARKET_CAP),
+            MAX_MCAP: Number(process.env.MAX_MARKET_CAP),
+            MIN_LIQ:  Number(process.env.MIN_LIQUIDITY),
+            MAX_LIQ:  Number(process.env.MAX_LIQUIDITY),
+            MIN_VOL:  Number(process.env.MIN_VOLUME),
+            MAX_VOL:  Number(process.env.MAX_VOLUME),
+            SLIP_BPS: Number(process.env.SLIPPAGE_BPS),
+            TP: Number(process.env.TAKE_PROFIT_PCT),
+            SL: Number(process.env.STOP_LOSS_PCT),
+            NOTIONAL: Number(process.env.TRADE_SIZE_USD),
           };
 
-          // Rotate between your two Helius RPC URLs
+          // Rotate between your two Helius RPC URLs (already in env as JSON array)
           const RPCS = JSON.parse(process.env.HELIUS_RPC_URLS_JSON || '[]');
           if (!Array.isArray(RPCS) || RPCS.length === 0) {
             console.error('HELIUS_RPC_URLS_JSON is empty or invalid.');
@@ -96,8 +98,12 @@ jobs:
 
           // Helpers
           const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-          async function backoff(fn, tries=6){ let d=500;
-            for (let i=0;i<tries;i++){ try{ return await fn(); }catch(e){ if(i===tries-1) throw e; await sleep(d); d*=2; } }
+          async function backoff(fn, tries=6){
+            let d=500;
+            for (let i=0;i<tries;i++){
+              try { return await fn(); }
+              catch(e){ if(i===tries-1) throw e; await sleep(d); d*=2; }
+            }
           }
           function postJSON(urlStr, bodyObj){
             return new Promise((resolve,reject)=>{
@@ -148,7 +154,7 @@ jobs:
                 if (t <= END) out.push({signature:x.signature, blockTime:t});
               }
               if (!keepPaging) break;
-              before = arr[arr.length-1]?.signature;
+              before = arr[arr.length-1] && arr[arr.length-1].signature;
               if (!before) break;
               await sleep(150); // gentle pacing
             }
@@ -158,8 +164,7 @@ jobs:
 
           // 2) Fetch tx details from Helius Enhanced API (rotating api-key derived from RPC URL)
           async function heliusEnhancedBatch(sigsChunk){
-            const rpcUrl = nextRpcUrl();
-            const apiKey = extractHeliusApiKey(rpcUrl);
+            const apiKey = extractHeliusApiKey(nextRpcUrl());
             if (!apiKey) throw new Error('Could not extract Helius api-key from RPC URL.');
             const qs = sigsChunk.map(s=>`txs[]=${encodeURIComponent(s.signature)}`).join('&');
             const url = `https://api.helius.xyz/v0/transactions/?api-key=${apiKey}&${qs}`;
@@ -182,8 +187,8 @@ jobs:
             const set=new Set();
             for(const tx of txs){
               const tt=tx?.tokenTransfers||[];
-              const usdc=tt.find(z=>z.mint===USDC);
-              const other=tt.find(z=>z.mint && z.mint!==USDC);
+              const usdc=Array.isArray(tt) ? tt.find(z=>z.mint===USDC) : null;
+              const other=Array.isArray(tt) ? tt.find(z=>z.mint && z.mint!==USDC) : null;
               if (usdc && other) set.add(other.mint);
             }
             return Array.from(set);
@@ -197,12 +202,12 @@ jobs:
               const url=`https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(chunk.join(','))}`;
               const json=await backoff(()=>getJSON(url), 6);
               for(const t of (json||[])){
-                const mint = t?.mint || t?.address || t?.id;
+                const mint = t && (t.mint || t.address || t.id);
                 if(!mint) continue;
-                const mcap = Number(t?.mcap ?? t?.marketCap ?? t?.stats?.marketCap ?? 0) || 0;
-                const liq  = Number(t?.liquidity ?? t?.stats?.liquidity ?? t?.stats24h?.liquidity ?? 0) || 0;
-                const v24  = Number((t?.stats24h?.buyVolume ?? 0) + (t?.stats24h?.sellVolume ?? 0) ||
-                                    t?.volume24h ?? t?.daily_volume ?? 0) || 0;
+                const mcap = Number((t.mcap ?? t.marketCap ?? (t.stats && t.stats.marketCap) ?? 0)) || 0;
+                const liq  = Number((t.liquidity ?? (t.stats && t.stats.liquidity) ?? (t.stats24h && t.stats24h.liquidity) ?? 0)) || 0;
+                const v24  = Number(((t.stats24h && (t.stats24h.buyVolume||0)) + (t.stats24h && (t.stats24h.sellVolume||0))) ||
+                                    t.volume24h || t.daily_volume || 0) || 0;
                 out.set(mint, {mcap, liquidity: liq, volume24h: v24});
               }
               await sleep(2000); // Jupiter ~30 rpm safety
@@ -214,13 +219,14 @@ jobs:
           function priceSeries(txs){
             const map=new Map(); // mint -> [{t, px}]
             for (const tx of txs){
-              const T=tx?.timestamp; if(!T) continue;
-              const tt=tx?.tokenTransfers||[];
+              const T=tx && tx.timestamp; if(!T) continue;
+              const tt=tx.tokenTransfers;
+              if(!Array.isArray(tt)) continue;
               const usdc=tt.find(z=>z.mint===USDC);
               const other=tt.find(z=>z.mint && z.mint!==USDC);
               if(!usdc||!other) continue;
-              const usdcAmt=Math.abs(usdc.tokenAmount||0);
-              const otherAmt=Math.abs(other.tokenAmount||0);
+              const usdcAmt=Math.abs(Number(usdc.tokenAmount||0));
+              const otherAmt=Math.abs(Number(other.tokenAmount||0));
               if(!usdcAmt||!otherAmt) continue;
               const px=usdcAmt/otherAmt; // USDC per token
               const arr=map.get(other.mint)||[];
@@ -289,7 +295,7 @@ jobs:
                 s.liquidity >= F.MIN_LIQ  && s.liquidity <= F.MAX_LIQ  &&
                 s.volume24h >= F.MIN_VOL  && s.volume24h <= F.MAX_VOL;
               if (ok) allow.add(mint);
-              snapshot.push({mint, ...s, pass: ok});
+              snapshot.push({mint, mcap:s.mcap, liquidity:s.liquidity, volume24h:s.volume24h, pass: ok});
             }
             console.log('Allowed mints:', allow.size);
 
@@ -301,6 +307,7 @@ jobs:
             const winRate = trades.length ? (wins/trades.length*100) : 0;
             const totalPNL = trades.reduce((a,b)=>a+b.pnl_usd,0);
 
+            if(!fs.existsSync('out')) fs.mkdirSync('out',{recursive:true});
             fs.writeFileSync('out/token_filter_snapshot.json', JSON.stringify(snapshot,null,2));
             fs.writeFileSync('out/trades.csv',
               'mint,entry_t,entry_px,exit_t,exit_px,reason,qty,pnl_usd\n' +
@@ -310,18 +317,13 @@ jobs:
               filters:F,
               trade_count: trades.length,
               wins,
-              win_rate_pct: +winRate.toFixed(2),
-              total_revenue_usd: +totalPNL.toFixed(2)
+              win_rate_pct: Number(winRate.toFixed(2)),
+              total_revenue_usd: Number(totalPNL.toFixed(2))
             }, null, 2));
 
             console.log(`DONE -> Trades=${trades.length} Wins=${wins} WinRate=${winRate.toFixed(2)}% TotalRevenueUSD=${totalPNL.toFixed(2)}`);
           })().catch(e=>{ console.error(e); process.exit(1); });
           JS
 
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: surfpool-test-results
-          path: out/
+          node run_backtest.js
 
