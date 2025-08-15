@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: surfpool-test
+  cancel-in-progress: true
+
 jobs:
   test-surfpool:
     runs-on: ubuntu-latest
