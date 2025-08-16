@@ -1,46 +1,52 @@
-name: Run Surfpool Tests (July 2025 + MCAP/LIQ/VOL filters + PnL)
+---
+name: Run Surfpool Tests (July 2025)
 
 on:
   push:
     branches: [ main ]
+    paths:
+      - ".github/workflows/test.yml"
   workflow_dispatch:
 
 concurrency:
   group: surfpool-test
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   test-surfpool:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
-    # === Inline config & keys (as requested) ===
     env:
-      # Rotate between TWO Helius RPC URLs (inline)
+      # RPC rotation (your two Helius URLs)
       HELIUS_RPC_URLS_JSON: >-
-        ["https://mainnet.helius-rpc.com/?api-key=6247588e-7f58-483f-bf97-e59ee1fcad3",
-         "https://mainnet.helius-rpc.com/?api-key=02a76c9f-34e8-4acf-bf36-c2b10b2a7fe2"]
+        ["https://mainnet.helius-rpc.com/?api-key=02a76c9f-34e8-4acf-bf36-c2b10b2a7fe2",
+         "https://mainnet.helius-rpc.com/?api-key=6247588e-7f58-483f-bf97-e59ee1fcad37"]
 
-      # Token we price everything against
+      # Token constants
       USDC_MINT: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      JUP_ROUTER: "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB"
 
-      # Your filters (USD)
+      # Window (UTC)
+      JULY_START_UTC: "2025-07-01T00:00:00Z"
+      JULY_END_UTC: "2025-07-31T23:59:59Z"
+
+      # Filters (USD) — MCAP via supply*median(px), LIQ via p90 swap size (USDC), VOL via sum of USDC
       MIN_MARKET_CAP: "50000"
       MAX_MARKET_CAP: "60000"
-      MIN_LIQUIDITY:  "10000"
-      MAX_LIQUIDITY:  "2000000"
-      MIN_VOLUME:     "10000"   # 24h volume
-      MAX_VOLUME:     "200000"  # 24h volume
+      MIN_LIQUIDITY: "10000"
+      MAX_LIQUIDITY: "2000000"
+      MIN_VOLUME: "10000"
+      MAX_VOLUME: "200000"
 
-      # Strategy params
-      SLIPPAGE_BPS: "500"       # 5%
-      TAKE_PROFIT_PCT: "3.0"    # 300%
-      STOP_LOSS_PCT:  "0.2"     # 20%
-      TRADE_SIZE_USD: "100"     # $100 per entry
-
-      # Jupiter router + window
-      JUP_ROUTER: "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB"
-      JULY_START_UTC: "2025-07-01T00:00:00Z"
-      JULY_END_UTC:   "2025-07-31T23:59:59Z"
+      # Strategy
+      SLIPPAGE_BPS: "500"   # 5%
+      TAKE_PROFIT_PCT: "3.0"   # 300%
+      STOP_LOSS_PCT: "0.2"   # 20%
+      TRADE_SIZE_USD: "100"
 
     steps:
       - name: Checkout
@@ -51,20 +57,17 @@ jobs:
         with:
           node-version: 20
 
-       
-     - name: Run backtest (fetch → filter via Jupiter → PnL)
+      - name: Run backtest (fetch → on-chain stats → filter → PnL)
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           mkdir -p data out
 
-          # Write the Node script to a file (avoids heredoc/YAML quoting issues)
           cat > run_backtest.js <<'JS'
           const fs = require('fs');
           const https = require('https');
           const { URL } = require('url');
 
-          // --------- ENV ---------
           const USDC = process.env.USDC_MINT;
           const JUP  = process.env.JUP_ROUTER;
           const START = Math.floor(new Date(process.env.JULY_START_UTC).getTime()/1000);
@@ -83,32 +86,19 @@ jobs:
             NOTIONAL: Number(process.env.TRADE_SIZE_USD),
           };
 
-          // Rotate between your two Helius RPC URLs (already in env as JSON array)
           const RPCS = JSON.parse(process.env.HELIUS_RPC_URLS_JSON || '[]');
           if (!Array.isArray(RPCS) || RPCS.length === 0) {
             console.error('HELIUS_RPC_URLS_JSON is empty or invalid.');
             process.exit(1);
           }
           let rpcIdx = 0;
-          function nextRpcUrl() { return RPCS[rpcIdx++ % RPCS.length]; }
+          const nextRpcUrl = () => RPCS[rpcIdx++ % RPCS.length];
 
-          // Extract api-key param from an RPC URL (for Helius Enhanced API calls)
-          function extractHeliusApiKey(rpcUrl) {
-            try {
-              const u = new URL(rpcUrl);
-              return u.searchParams.get('api-key') || '';
-            } catch { return ''; }
-          }
-
-          // Helpers
           const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-          async function backoff(fn, tries=6){
-            let d=500;
-            for (let i=0;i<tries;i++){
-              try { return await fn(); }
-              catch(e){ if(i===tries-1) throw e; await sleep(d); d*=2; }
-            }
+          async function backoff(fn, tries=6){ let d=500;
+            for (let i=0;i<tries;i++){ try { return await fn(); } catch(e){ if(i===tries-1) throw e; await sleep(d); d*=2; } }
           }
+
           function postJSON(urlStr, bodyObj){
             return new Promise((resolve,reject)=>{
               const u = new URL(urlStr);
@@ -118,11 +108,8 @@ jobs:
                 method: 'POST', headers: { 'Content-Type':'application/json' }
               }, res=>{
                 let b=''; res.on('data',c=>b+=c); res.on('end',()=>{
-                  try {
-                    const j = JSON.parse(b);
-                    if (j.error) return reject(new Error(JSON.stringify(j.error)));
-                    resolve(j);
-                  } catch(e){ reject(e); }
+                  try { const j = JSON.parse(b); if (j.error) return reject(new Error(JSON.stringify(j.error))); resolve(j); }
+                  catch(e){ reject(e); }
                 });
               });
               req.on('error', reject); req.write(body); req.end();
@@ -132,16 +119,13 @@ jobs:
             return new Promise((resolve,reject)=>{
               https.get(urlStr, res=>{
                 let b=''; res.on('data',c=>b+=c); res.on('end',()=>{
-                  try {
-                    if (res.statusCode && res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}: ${b}`));
-                    resolve(JSON.parse(b));
-                  } catch(e){ reject(e); }
+                  try { if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}: ${b}`)); resolve(JSON.parse(b)); }
+                  catch(e){ reject(e); }
                 });
               }).on('error', reject);
             });
           }
 
-          // 1) Fetch Jupiter signatures for July via rotating RPCs
           async function fetchJupiterSigsJuly(){
             let out=[], before=null;
             for(;;){
@@ -150,26 +134,27 @@ jobs:
               const resp = await backoff(()=>postJSON(rpcUrl, {jsonrpc:'2.0', id:1, method:'getSignaturesForAddress', params}), 6);
               const arr = resp.result || [];
               if (!arr.length) break;
-
-              let keepPaging = true;
+              let keep = true;
               for (const x of arr){
                 const t = x.blockTime|0; if(!t) continue;
-                if (t < START){ keepPaging = false; break; }
+                if (t < START){ keep = false; break; }
                 if (t <= END) out.push({signature:x.signature, blockTime:t});
               }
-              if (!keepPaging) break;
+              if (!keep) break;
               before = arr[arr.length-1] && arr[arr.length-1].signature;
               if (!before) break;
-              await sleep(150); // gentle pacing
+              await sleep(150);
             }
             out.sort((a,b)=>(a.blockTime||0)-(b.blockTime||0));
             return out;
           }
 
-          // 2) Fetch tx details from Helius Enhanced API (rotating api-key derived from RPC URL)
+          function extractHeliusApiKey(rpcUrl){
+            try { return new URL(rpcUrl).searchParams.get('api-key') || ''; } catch { return ''; }
+          }
           async function heliusEnhancedBatch(sigsChunk){
             const apiKey = extractHeliusApiKey(nextRpcUrl());
-            if (!apiKey) throw new Error('Could not extract Helius api-key from RPC URL.');
+            if (!apiKey) throw new Error('No Helius api-key in RPC URL.');
             const qs = sigsChunk.map(s=>`txs[]=${encodeURIComponent(s.signature)}`).join('&');
             const url = `https://api.helius.xyz/v0/transactions/?api-key=${apiKey}&${qs}`;
             return await backoff(()=>getJSON(url), 6);
@@ -177,92 +162,117 @@ jobs:
           async function fetchAllTxs(sigs){
             const out=[]; let i=0;
             while(i<sigs.length){
-              const chunk=sigs.slice(i,i+20);      // batch of 20
+              const chunk=sigs.slice(i,i+20);
               const data=await heliusEnhancedBatch(chunk);
               out.push(...data);
               i+=20;
-              await sleep(600);                    // throttle to be safe
+              await sleep(600);
             }
             return out;
           }
 
-          // 3) Extract non-USDC mints that traded vs USDC
-          function extractMints(txs){
-            const set=new Set();
-            for(const tx of txs){
-              const tt=tx?.tokenTransfers||[];
-              const usdc=Array.isArray(tt) ? tt.find(z=>z.mint===USDC) : null;
-              const other=Array.isArray(tt) ? tt.find(z=>z.mint && z.mint!==USDC) : null;
-              if (usdc && other) set.add(other.mint);
-            }
-            return Array.from(set);
-          }
-
-          // 4) Query Jupiter Token API v2 for mcap/liquidity/24h volume, batched
-          async function jupStats(mints){
-            const out=new Map();
-            for (let i=0;i<mints.length;i+=100){
-              const chunk=mints.slice(i,i+100);
-              const url=`https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(chunk.join(','))}`;
-              const json=await backoff(()=>getJSON(url), 6);
-              for(const t of (json||[])){
-                const mint = t && (t.mint || t.address || t.id);
-                if(!mint) continue;
-                const mcap = Number((t.mcap ?? t.marketCap ?? (t.stats && t.stats.marketCap) ?? 0)) || 0;
-                const liq  = Number((t.liquidity ?? (t.stats && t.stats.liquidity) ?? (t.stats24h && t.stats24h.liquidity) ?? 0)) || 0;
-                const v24  = Number(((t.stats24h && (t.stats24h.buyVolume||0)) + (t.stats24h && (t.stats24h.sellVolume||0))) ||
-                                    t.volume24h || t.daily_volume || 0) || 0;
-                out.set(mint, {mcap, liquidity: liq, volume24h: v24});
-              }
-              await sleep(2000); // Jupiter ~30 rpm safety
-            }
-            return out;
-          }
-
-          // 5) Build per-mint price series (USDC per token)
-          function priceSeries(txs){
-            const map=new Map(); // mint -> [{t, px}]
+          function extractMintsAndSeries(txs){
+            const seriesMap = new Map(); // mint -> [{t, px, usd}]
+            const volUsd = new Map();    // mint -> total USDC
             for (const tx of txs){
-              const T=tx && tx.timestamp; if(!T) continue;
-              const tt=tx.tokenTransfers;
-              if(!Array.isArray(tt)) continue;
-              const usdc=tt.find(z=>z.mint===USDC);
-              const other=tt.find(z=>z.mint && z.mint!==USDC);
+              const T = tx?.timestamp; if(!T) continue;
+              const tt = tx?.tokenTransfers; if(!Array.isArray(tt)) continue;
+              const usdc = tt.find(z=>z.mint===USDC);
+              const other= tt.find(z=>z.mint && z.mint!==USDC);
               if(!usdc||!other) continue;
-              const usdcAmt=Math.abs(Number(usdc.tokenAmount||0));
-              const otherAmt=Math.abs(Number(other.tokenAmount||0));
+
+              const usdcAmt = Math.abs(Number(usdc.tokenAmount||0));
+              const otherAmt= Math.abs(Number(other.tokenAmount||0));
               if(!usdcAmt||!otherAmt) continue;
-              const px=usdcAmt/otherAmt; // USDC per token
-              const arr=map.get(other.mint)||[];
-              arr.push({t:T, px});
-              map.set(other.mint, arr);
+
+              const px = usdcAmt/otherAmt;
+              const arr = seriesMap.get(other.mint) || [];
+              arr.push({t:T, px, usd:usdcAmt});
+              seriesMap.set(other.mint, arr);
+
+              volUsd.set(other.mint, (volUsd.get(other.mint)||0)+usdcAmt);
             }
-            for(const [k,v] of map) v.sort((a,b)=>a.t-b.t);
-            return map;
+            for(const [k,v] of seriesMap) v.sort((a,b)=>a.t-b.t);
+            return {seriesMap, volUsd};
           }
 
-          // 6) Backtest with TP/SL + slippage
+          function median(arr){ if (!arr.length) return 0; const s=[...arr].sort((a,b)=>a-b); const m=Math.floor(s.length/2); return s.length%2?s[m]:(s[m-1]+s[m])/2; }
+          function p90(arr){ if (!arr.length) return 0; const s=[...arr].sort((a,b)=>a-b); const idx=Math.floor(0.9*(s.length-1)); return s[idx]; }
+
+          async function rpcCall(method, params){
+            const url = nextRpcUrl();
+            const body = {jsonrpc:'2.0', id:1, method, params};
+            const resp = await backoff(()=>postJSON(url, body), 6);
+            if (resp.error) throw new Error(JSON.stringify(resp.error));
+            return resp.result;
+          }
+          async function getSupplyForMints(mints){
+            const entries = Array.from(mints);
+            const out = new Map();
+            const LIMIT = 5; let i=0, active=0;
+            return await new Promise((resolve,reject)=>{
+              function next(){
+                while(active<LIMIT && i<entries.length){
+                  const mint = entries[i++]; active++;
+                  rpcCall('getTokenSupply', [mint]).then(r=>{
+                    const v = r && r.value;
+                    const dec = v?.decimals ?? 0;
+                    const raw = Number(v?.amount || '0');
+                    const supply = dec ? raw / (10**dec) : raw;
+                    out.set(mint, Number.isFinite(supply)? supply : 0);
+                  }).catch(_=>{
+                    out.set(mint, 0);
+                  }).finally(()=>{
+                    active--;
+                    if (i>=entries.length && active===0) resolve(out); else next();
+                  });
+                }
+              }
+              next();
+            });
+          }
+
+          function buildStatsAndFilter(seriesMap, volUsd, supplyMap, F){
+            const allow = new Set();
+            const snapshot = [];
+            for (const [mint, arr] of seriesMap){
+              const pxs = arr.map(x=>x.px);
+              const medPx = median(pxs);
+              const sizes = arr.map(x=>x.usd);
+              const p90Size = p90(sizes);
+
+              const supply = supplyMap.get(mint) || 0;
+              const mcap = medPx * supply;
+              const vol = volUsd.get(mint) || 0;
+
+              const pass =
+                mcap >= F.MIN_MCAP && mcap <= F.MAX_MCAP &&
+                p90Size >= F.MIN_LIQ && p90Size <= F.MAX_LIQ &&
+                vol >= F.MIN_VOL && vol <= F.MAX_VOL;
+
+              if (pass) allow.add(mint);
+              snapshot.push({mint, mcap: Number(mcap.toFixed(2)), liquidity_proxy_p90_usdc: Number(p90Size.toFixed(2)), volume_usd: Number(vol.toFixed(2)), pass});
+            }
+            return {allow, snapshot};
+          }
+
           function runBacktest(seriesMap, allow, F){
             const trades=[];
             const slip = F.SLIP_BPS/10000;
             for(const [mint, series] of seriesMap){
               if(!allow.has(mint)) continue;
               if(series.length<2) continue;
-
               const entryPx=series[0].px;
               const qty=F.NOTIONAL/entryPx;
-
               let exit=series[series.length-1], reason='EOD';
               for(let i=1;i<series.length;i++){
                 const r=(series[i].px-entryPx)/entryPx;
                 if(r>=F.TP){ exit=series[i]; reason='TP'; break; }
                 if(r<=-F.SL){ exit=series[i]; reason='SL'; break; }
               }
-
               const buyPx  = entryPx*(1+slip);
               const sellPx = exit.px*(1-slip);
               const pnlUSD = (sellPx - buyPx)*qty;
-
               trades.push({mint, entry_t:series[0].t, entry_px:entryPx, exit_t:exit.t, exit_px:exit.px, reason, qty, pnl_usd:pnlUSD});
             }
             return trades;
@@ -272,40 +282,30 @@ jobs:
             console.log('Step 1: Fetching July Jupiter signatures…');
             const sigs = await fetchJupiterSigsJuly();
             if(!sigs.length){
-              console.log('No Jupiter signatures found in window.');
               fs.writeFileSync('out/summary.json', JSON.stringify({trade_count:0, wins:0, win_rate_pct:0, total_revenue_usd:0}, null, 2));
+              console.log('No signatures in window. Exiting clean.');
               process.exit(0);
             }
             fs.writeFileSync('data/surfpool-replay.json', JSON.stringify(sigs,null,2));
             console.log('Signatures:', sigs.length);
 
-            console.log('Step 2: Fetching Helius Enhanced txs (rotating keys)…');
+            console.log('Step 2: Fetching Helius Enhanced txs…');
             const txs = await fetchAllTxs(sigs);
 
-            console.log('Step 3: Extracting non-USDC mints…');
-            const mints = extractMints(txs);
-            console.log('Unique mints vs USDC:', mints.length);
+            console.log('Step 3: Building price series & volume…');
+            const {seriesMap, volUsd} = extractMintsAndSeries(txs);
+            const mints = Array.from(seriesMap.keys());
+            console.log('Mints with USDC swaps:', mints.length);
 
-            console.log('Step 4: Querying Jupiter Token API v2 (mcap/liquidity/24h volume)…');
-            const stats = await jupStats(mints);
+            console.log('Step 4: Fetching on-chain token supply…');
+            const supplyMap = await getSupplyForMints(mints);
 
-            // Build allowlist by thresholds
-            const allow = new Set();
-            const snapshot = [];
-            for(const mint of mints){
-              const s = stats.get(mint) || {mcap:0, liquidity:0, volume24h:0};
-              const ok =
-                s.mcap      >= F.MIN_MCAP && s.mcap      <= F.MAX_MCAP &&
-                s.liquidity >= F.MIN_LIQ  && s.liquidity <= F.MAX_LIQ  &&
-                s.volume24h >= F.MIN_VOL  && s.volume24h <= F.MAX_VOL;
-              if (ok) allow.add(mint);
-              snapshot.push({mint, mcap:s.mcap, liquidity:s.liquidity, volume24h:s.volume24h, pass: ok});
-            }
+            console.log('Step 5: Computing stats & applying filters…');
+            const {allow, snapshot} = buildStatsAndFilter(seriesMap, volUsd, supplyMap, F);
             console.log('Allowed mints:', allow.size);
 
-            console.log('Step 5: Building price series + running backtest…');
-            const ps = priceSeries(txs);
-            const trades = runBacktest(ps, allow, F);
+            console.log('Step 6: Backtesting TP/SL…');
+            const trades = runBacktest(seriesMap, allow, F);
 
             const wins = trades.filter(t=>t.pnl_usd>0).length;
             const winRate = trades.length ? (wins/trades.length*100) : 0;
@@ -330,4 +330,11 @@ jobs:
           JS
 
           node run_backtest.js
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surfpool-test-results
+          path: out/
 
