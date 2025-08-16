@@ -23,8 +23,9 @@ jobs:
     env:
       # RPC rotation (your two Helius URLs) — Option B (secrets -> JSON)
       HELIUS_RPC_URLS_JSON: >-
-        ["https://mainnet.helius-rpc.com/?api-key=${{ secrets.HELIUS_API_KEY_1 }}",
-         "https://mainnet.helius-rpc.com/?api-key=${{ secrets.HELIUS_API_KEY_2 }}"]
+        ["https://mainnet.helius-rpc.com/?api-key=6247588e-7f58-483f-bf97-e59ee1fcad37",
+         "https://mainnet.helius-rpc.com/?api-key=02a76c9f-34e8-4acf-bf36-c2b10b2a7fe2"]
+
 
       # Token constants
       USDC_MINT: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
