@@ -18,22 +18,23 @@ permissions:
 jobs:
   test-surfpool:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360   # allow up to 6 hours total per matrix run
+    strategy:
+      fail-fast: false
+      matrix:
+        window:
+          - { name: "2025-07-01_to_2025-07-15", start: "2025-07-01T00:00:00Z", end: "2025-07-15T23:59:59Z" }
+          - { name: "2025-07-16_to_2025-07-31", start: "2025-07-16T00:00:00Z", end: "2025-07-31T23:59:59Z" }
 
     env:
-      # RPC rotation (your two Helius URLs) — Option B (secrets -> JSON)
+      # RPC rotation (your two Helius URLs) — Option B with your keys
       HELIUS_RPC_URLS_JSON: >-
         ["https://mainnet.helius-rpc.com/?api-key=6247588e-7f58-483f-bf97-e59ee1fcad37",
          "https://mainnet.helius-rpc.com/?api-key=02a76c9f-34e8-4acf-bf36-c2b10b2a7fe2"]
 
-
       # Token constants
       USDC_MINT: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
       JUP_ROUTER: "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB"
-
-      # Window (UTC)
-      JULY_START_UTC: "2025-07-01T00:00:00Z"
-      JULY_END_UTC: "2025-07-31T23:59:59Z"
 
       # Filters (USD) — MCAP via supply*median(px), LIQ via p90 swap size (USDC), VOL via sum of USDC
       MIN_MARKET_CAP: "50000"
@@ -49,6 +50,10 @@ jobs:
       STOP_LOSS_PCT: "0.2"     # 20%
       TRADE_SIZE_USD: "100"
 
+      # Matrix-provided window (assigned in "env" per job below)
+      JULY_START_UTC: ${{ matrix.window.start }}
+      JULY_END_UTC:   ${{ matrix.window.end }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,8 +63,28 @@ jobs:
         with:
           node-version: 20
 
+      # Optional: confirm keys are present without leaking them
+      - name: Debug Helius URLs (safe)
+        shell: bash
+        run: |
+          node -e '
+            const r=process.env.HELIUS_RPC_URLS_JSON||"";
+            console.log("HELIUS_RPC_URLS_JSON length:", r.length);
+            try {
+              const arr = JSON.parse(r);
+              const lens = arr.map(u => {
+                const m = /[?&]api-key=([^&"]*)/.exec(String(u));
+                return m && m[1] ? m[1].length : 0;
+              });
+              console.log("api-key lengths:", lens);
+            } catch(e) {
+              console.error("JSON parse error:", e.message); process.exit(1);
+            }
+          '
+
       - name: Run backtest (fetch → on-chain stats → filter → PnL)
         shell: bash
+        timeout-minutes: 330   # lower than job timeout so upload step still runs
         run: |
           set -Eeuo pipefail
           mkdir -p data out
@@ -138,9 +163,8 @@ jobs:
             }).then(r => r.json);
           }
 
-          // --- Jupiter signatures ---
           async function fetchJupiterSigsJuly(){
-            let out=[], before=null;
+            let out=[], before=null, fetched=0;
             for(;;){
               const rpcUrl = nextRpcUrl();
               const params = before ? [JUP, {limit:1000, before}] : [JUP, {limit:1000}];
@@ -153,16 +177,18 @@ jobs:
                 if (t < START){ keep = false; break; }
                 if (t <= END) out.push({signature:x.signature, blockTime:t});
               }
+              fetched += arr.length;
+              if ((fetched % 5000) === 0) console.log(`[${new Date().toISOString()}] sigs fetched (raw pages): ${fetched}`);
               if (!keep) break;
               before = arr[arr.length-1] && arr[arr.length-1].signature;
               if (!before) break;
               await sleep(150);
             }
             out.sort((a,b)=>(a.blockTime||0)-(b.blockTime||0));
+            console.log(`[${new Date().toISOString()}] sigs in window: ${out.length}`);
             return out;
           }
 
-          // --- Helius Enhanced Transactions (robust formats) ---
           function extractAnyHeliusApiKey(rpcs){
             for (const u of rpcs) { try {
               const key = new URL(u).searchParams.get('api-key');
@@ -196,9 +222,11 @@ jobs:
           }
 
           async function fetchAllTxs(sigs){
-            const out=[]; 
-            let chunkSize = 10; // conservative
+            const out=[];
+            let chunkSize = 10;
             let i=0;
+            const total = sigs.length;
+            const startTs = Date.now();
             while(i<sigs.length){
               const chunk = sigs.slice(i, i+chunkSize);
               try {
@@ -206,11 +234,16 @@ jobs:
                 if (!Array.isArray(data)) throw new Error(`Enhanced API returned non-array payload: ${JSON.stringify(data).slice(0,300)}...`);
                 out.push(...data);
                 i += chunk.length;
+                if (i % 100 === 0 || i === total) {
+                  const mins = ((Date.now()-startTs)/60000).toFixed(1);
+                  console.log(`[${new Date().toISOString()}] enhanced progress ${i}/${total} (${(i/total*100).toFixed(1)}%) elapsed ${mins}m`);
+                }
                 await sleep(600);
               } catch (e) {
                 const msg = String(e && e.message || e);
                 if (chunk.length > 1 && (msg.includes('HTTP 400') || msg.includes('429') || (e && e.code === 'HELIUS_FORMATS_FAILED'))) {
                   chunkSize = Math.max(1, Math.floor(chunkSize/2));
+                  console.log(`[${new Date().toISOString()}] throttled/400; reducing chunkSize to ${chunkSize}`);
                   await sleep(1000);
                   continue;
                 }
@@ -221,10 +254,9 @@ jobs:
             return out;
           }
 
-          // --- Stats & backtest ---
           function extractMintsAndSeries(txs){
-            const seriesMap = new Map(); // mint -> [{t, px, usd}]
-            const volUsd = new Map();    // mint -> total USDC
+            const seriesMap = new Map();
+            const volUsd = new Map();
             for (const tx of txs){
               const T = tx?.timestamp; if(!T) continue;
               const tt = tx?.tokenTransfers; if(!Array.isArray(tt)) continue;
@@ -330,6 +362,7 @@ jobs:
           }
 
           (async ()=>{
+            console.log(`Window: ${process.env.JULY_START_UTC} -> ${process.env.JULY_END_UTC}`);
             console.log('Step 1: Fetching July Jupiter signatures…');
             const sigs = await fetchJupiterSigsJuly();
             if(!sigs.length){
@@ -380,12 +413,15 @@ jobs:
           })().catch(e=>{ console.error(e); process.exit(1); });
           JS
 
-          node run_backtest.js
+          # Run and tee to a file so we can always retrieve logs
+          node run_backtest.js 2>&1 | tee out/run.log
 
-      - name: Upload results
+      - name: Upload logs and results (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: surfpool-test-results
-          path: out/
+          name: surfpool-results-${{ matrix.window.name }}
+          path: |
+            out/
+            data/. 
 
