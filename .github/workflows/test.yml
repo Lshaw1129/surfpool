@@ -18,12 +18,13 @@ permissions:
 jobs:
   test-surfpool:
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 180
 
-env:
-  HELIUS_RPC_URLS_JSON: >-
-    ["https://mainnet.helius-rpc.com/?api-key=${{ secrets.HELIUS_API_KEY_1 }}",
-     "https://mainnet.helius-rpc.com/?api-key=${{ secrets.HELIUS_API_KEY_2 }}"]
+    env:
+      # RPC rotation (your two Helius URLs) — Option B (secrets -> JSON)
+      HELIUS_RPC_URLS_JSON: >-
+        ["https://mainnet.helius-rpc.com/?api-key=${{ secrets.HELIUS_API_KEY_1 }}",
+         "https://mainnet.helius-rpc.com/?api-key=${{ secrets.HELIUS_API_KEY_2 }}"]
 
       # Token constants
       USDC_MINT: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -42,9 +43,9 @@ env:
       MAX_VOLUME: "200000"
 
       # Strategy
-      SLIPPAGE_BPS: "500"   # 5%
+      SLIPPAGE_BPS: "500"      # 5%
       TAKE_PROFIT_PCT: "3.0"   # 300%
-      STOP_LOSS_PCT: "0.2"   # 20%
+      STOP_LOSS_PCT: "0.2"     # 20%
       TRADE_SIZE_USD: "100"
 
     steps:
@@ -95,36 +96,48 @@ env:
 
           const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
           async function backoff(fn, tries=6){ let d=500;
-            for (let i=0;i<tries;i++){ try { return await fn(); } catch(e){ if(i===tries-1) throw e; await sleep(d); d*=2; } }
+            for (let i=0;i<tries;i++){ try { return await fn(); } catch(e){ if(i===tries-1) throw e; await sleep(d); d=Math.min(d*2, 8000); } }
+          }
+
+          function httpRequest(opts, bodyStr){
+            return new Promise((resolve,reject)=>{
+              const req = https.request(opts, res=>{
+                let b=''; res.on('data',c=>b+=c); res.on('end',()=>{
+                  const out = { statusCode: res.statusCode, body: b };
+                  if ((res.statusCode||0) >= 400) {
+                    return reject(Object.assign(new Error(`HTTP ${res.statusCode}: ${b || '<empty>'}`), out));
+                  }
+                  try { resolve({ ...out, json: b ? JSON.parse(b) : null }); } catch(e){ reject(Object.assign(e, out)); }
+                });
+              });
+              req.on('error', reject);
+              if (bodyStr) req.write(bodyStr);
+              req.end();
+            });
           }
 
           function postJSON(urlStr, bodyObj){
-            return new Promise((resolve,reject)=>{
-              const u = new URL(urlStr);
-              const body = JSON.stringify(bodyObj);
-              const req = https.request({
-                hostname: u.hostname, path: u.pathname + u.search, protocol: u.protocol,
-                method: 'POST', headers: { 'Content-Type':'application/json' }
-              }, res=>{
-                let b=''; res.on('data',c=>b+=c); res.on('end',()=>{
-                  try { const j = JSON.parse(b); if (j.error) return reject(new Error(JSON.stringify(j.error))); resolve(j); }
-                  catch(e){ reject(e); }
-                });
-              });
-              req.on('error', reject); req.write(body); req.end();
-            });
+            const u = new URL(urlStr);
+            const body = JSON.stringify(bodyObj);
+            return httpRequest({
+              hostname: u.hostname,
+              path: u.pathname + u.search,
+              protocol: u.protocol,
+              method: 'POST',
+              headers: { 'Content-Type':'application/json', 'Content-Length': Buffer.byteLength(body) }
+            }, body).then(r => r.json);
           }
           function getJSON(urlStr){
-            return new Promise((resolve,reject)=>{
-              https.get(urlStr, res=>{
-                let b=''; res.on('data',c=>b+=c); res.on('end',()=>{
-                  try { if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}: ${b}`)); resolve(JSON.parse(b)); }
-                  catch(e){ reject(e); }
-                });
-              }).on('error', reject);
-            });
+            const u = new URL(urlStr);
+            return httpRequest({
+              hostname: u.hostname,
+              path: u.pathname + u.search,
+              protocol: u.protocol,
+              method: 'GET'
+            }).then(r => r.json);
           }
 
+          // --- Jupiter signatures ---
           async function fetchJupiterSigsJuly(){
             let out=[], before=null;
             for(;;){
@@ -148,28 +161,66 @@ env:
             return out;
           }
 
-          function extractHeliusApiKey(rpcUrl){
-            try { return new URL(rpcUrl).searchParams.get('api-key') || ''; } catch { return ''; }
+          // --- Helius Enhanced Transactions (robust formats) ---
+          function extractAnyHeliusApiKey(rpcs){
+            for (const u of rpcs) { try {
+              const key = new URL(u).searchParams.get('api-key');
+              if (key) return key;
+            } catch {} }
+            return '';
           }
-          async function heliusEnhancedBatch(sigsChunk){
-            const apiKey = extractHeliusApiKey(nextRpcUrl());
-            if (!apiKey) throw new Error('No Helius api-key in RPC URL.');
-            const qs = sigsChunk.map(s=>`txs[]=${encodeURIComponent(s.signature)}`).join('&');
-            const url = `https://api.helius.xyz/v0/transactions/?api-key=${apiKey}&${qs}`;
-            return await backoff(()=>getJSON(url), 6);
+          const HELIUS_KEY = extractAnyHeliusApiKey(RPCS);
+          if (!HELIUS_KEY) {
+            console.error('No Helius api-key found in HELIUS_RPC_URLS_JSON URLs.');
+            process.exit(1);
           }
+
+          async function heliusEnhancedFetch(sigs){
+            const base = `https://api.helius.xyz/v0/transactions/?api-key=${HELIUS_KEY}`;
+            try { return await backoff(()=>postJSON(base, { transactions: sigs }), 3); }
+            catch (e1) {
+              try { return await backoff(()=>postJSON(base, { ids: sigs }), 3); }
+              catch (e2) {
+                try {
+                  const qs = sigs.map(s=>`transactions=${encodeURIComponent(s)}`).join('&');
+                  return await backoff(()=>getJSON(`${base}&${qs}`), 3);
+                } catch (e3) {
+                  const qs = sigs.map(s=>`txs[]=${encodeURIComponent(s)}`).join('&');
+                  const err = new Error(`All Helius Enhanced formats failed. Last URL: ${base}&${qs}\nFirst: ${e1}\nSecond: ${e2}\nThird: ${e3}`);
+                  err.code = 'HELIUS_FORMATS_FAILED';
+                  throw err;
+                }
+              }
+            }
+          }
+
           async function fetchAllTxs(sigs){
-            const out=[]; let i=0;
+            const out=[]; 
+            let chunkSize = 10; // conservative
+            let i=0;
             while(i<sigs.length){
-              const chunk=sigs.slice(i,i+20);
-              const data=await heliusEnhancedBatch(chunk);
-              out.push(...data);
-              i+=20;
-              await sleep(600);
+              const chunk = sigs.slice(i, i+chunkSize);
+              try {
+                const data = await heliusEnhancedFetch(chunk.map(x=>x.signature));
+                if (!Array.isArray(data)) throw new Error(`Enhanced API returned non-array payload: ${JSON.stringify(data).slice(0,300)}...`);
+                out.push(...data);
+                i += chunk.length;
+                await sleep(600);
+              } catch (e) {
+                const msg = String(e && e.message || e);
+                if (chunk.length > 1 && (msg.includes('HTTP 400') || msg.includes('429') || (e && e.code === 'HELIUS_FORMATS_FAILED'))) {
+                  chunkSize = Math.max(1, Math.floor(chunkSize/2));
+                  await sleep(1000);
+                  continue;
+                }
+                console.error(`Enhanced fetch failed at index ${i} (chunkSize=${chunkSize}). Error: ${msg}`);
+                throw e;
+              }
             }
             return out;
           }
 
+          // --- Stats & backtest ---
           function extractMintsAndSeries(txs){
             const seriesMap = new Map(); // mint -> [{t, px, usd}]
             const volUsd = new Map();    // mint -> total USDC
