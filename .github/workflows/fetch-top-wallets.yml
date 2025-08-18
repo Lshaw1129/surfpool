@@ -14,6 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
+    # Use either two key secrets or a single JSON secret. Both are supported.
+    env:
+      HELIUS1: ${{ secrets.HELIUS_API_KEY_1 }}
+      HELIUS2: ${{ secrets.HELIUS_API_KEY_2 }}
+      HELIUS_RPC_URLS_JSON: ${{ secrets.HELIUS_RPC_URLS_JSON }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -24,61 +30,76 @@ jobs:
           node-version: 20
           check-latest: true
 
+      - name: Install jq
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
       - name: Sanity checks (script & secrets)
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Script must exist
           if [ ! -f "surfpool-backtest/fetch_top_wallets_july.js" ]; then
             echo "ERROR: Missing script at surfpool-backtest/fetch_top_wallets_july.js"
-            echo "       (Update the workflow run path or commit the script.)"
             exit 1
           fi
-          # Secrets must be present
-          if [ -z "${{ secrets.HELIUS_API_KEY_1 }}" ] || [ -z "${{ secrets.HELIUS_API_KEY_2 }}" ]; then
-            echo "ERROR: Missing secrets HELIUS_API_KEY_1 and/or HELIUS_API_KEY_2."
-            echo "       Add them in: Settings -> Secrets and variables -> Actions."
-            exit 1
+          # Allow either two keys or a single JSON array of URLs
+          if [ -z "${HELIUS_RPC_URLS_JSON:-}" ]; then
+            if [ -z "${HELIUS1:-}" ] || [ -z "${HELIUS2:-}" ]; then
+              echo "ERROR: Provide HELIUS_API_KEY_1 and HELIUS_API_KEY_2 secrets OR HELIUS_RPC_URLS_JSON"
+              exit 1
+            fi
           fi
-          node -v
-          echo "Sanity checks passed."
+          echo "Sanity checks passed. Node: $(node -v)"
 
-      - name: Create config.july.json from secrets
+      - name: Create config.july.json (safe with jq)
         shell: bash
-        env:
-          HELIUS1: ${{ secrets.HELIUS_API_KEY_1 }}
-          HELIUS2: ${{ secrets.HELIUS_API_KEY_2 }}
         run: |
           set -Eeuo pipefail
           mkdir -p data
-          cat > config.july.json <<'JSON'
-          {
-            "rpc_urls": [
-              "https://mainnet.helius-rpc.com/?api-key=${HELIUS1}",
-              "https://mainnet.helius-rpc.com/?api-key=${HELIUS2}"
-            ],
-            "start_iso": "2025-07-01T00:00:00Z",
-            "end_iso":   "2025-07-31T23:59:59Z",
-            "max_minutes": 170,
-            "page_limit": 1000,
-            "per_tx_delay_ms": 250,
-            "max_backoff_ms": 8000
-          }
-          JSON
-          # Expand env vars inside JSON
-          sed -i "s|\${HELIUS1}|${HELIUS1}|g; s|\${HELIUS2}|${HELIUS2}|g" config.july.json
-          echo "Wrote config.july.json (masked keys below):"
-          sed 's/api-key=[A-Za-z0-9-]*/api-key=****/g' config.july.json
+
+          if [ -n "${HELIUS_RPC_URLS_JSON:-}" ]; then
+            # Validate it's valid JSON array
+            echo "${HELIUS_RPC_URLS_JSON}" | jq -e . >/dev/null
+            RPCS_JSON="${HELIUS_RPC_URLS_JSON}"
+          else
+            RPCS_JSON=$(jq -cn --arg k1 "$HELIUS1" --arg k2 "$HELIUS2" \
+              '[ "https://mainnet.helius-rpc.com/?api-key=\($k1)",
+                 "https://mainnet.helius-rpc.com/?api-key=\($k2)" ]')
+          fi
+
+          jq -n \
+            --argjson rpcs "$RPCS_JSON" \
+            --arg start "2025-07-01T00:00:00Z" \
+            --arg end   "2025-07-31T23:59:59Z" \
+            --argjson max_minutes 170 \
+            --argjson page_limit 1000 \
+            --argjson per_tx_delay_ms 250 \
+            --argjson max_backoff_ms 8000 \
+            '{ rpc_urls: $rpcs,
+               start_iso: $start,
+               end_iso: $end,
+               max_minutes: $max_minutes,
+               page_limit: $page_limit,
+               per_tx_delay_ms: $per_tx_delay_ms,
+               max_backoff_ms: $max_backoff_ms }' > config.july.json
+
+          echo "Wrote config.july.json (masked):"
+          jq '
+            .rpc_urls |= (map( gsub("api-key=[A-Za-z0-9-]+"; "api-key=****") ))
+          ' config.july.json
 
       - name: Run fetch_top_wallets_july.js
         shell: bash
         timeout-minutes: 330
         run: |
           set -Eeuo pipefail
-          # Ensure data dir exists for outputs
           mkdir -p data
-          # Run from repo root; script should write to ./data/
-          node surfpool-backtest/fetch_top_wallets_july.js 2>&1 | tee data/run.log
+          # If your script supports reading CONFIG path, export it:
+          export CONFIG_PATH="$GITHUB_WORKSPACE/config.july.json"
+          node surfpool-backtest/fetch_top_wallets_july.js 2>&1 | tee data/run.log || true
 
       - name: Summarize results (if present)
         if: always()
@@ -111,5 +132,7 @@ jobs:
             config.july.json
           if-no-files-found: warn
           retention-days: 14
+
+
 
 
