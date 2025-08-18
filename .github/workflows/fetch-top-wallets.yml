@@ -1,0 +1,83 @@
+name: Fetch Top Wallets (July 2025) + Artifact
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: fetch-top-wallets
+  cancel-in-progress: true
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # hard cap; your script also has its own max_minutes
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps (if any)
+        run: npm ci || npm install
+
+      - name: Create config.july.json from secrets
+        shell: bash
+        env:
+          HELIUS1: ${{ secrets.HELIUS_API_KEY_1 }}
+          HELIUS2: ${{ secrets.HELIUS_API_KEY_2 }}
+        run: |
+          mkdir -p data
+          cat > config.july.json <<'JSON'
+          {
+            "rpc_urls": [
+              "https://mainnet.helius-rpc.com/?api-key=${HELIUS1}",
+              "https://mainnet.helius-rpc.com/?api-key=${HELIUS2}"
+            ],
+            "start_iso": "2025-07-01T00:00:00Z",
+            "end_iso":   "2025-07-31T23:59:59Z",
+            "max_minutes": 170,
+            "page_limit": 1000,
+            "per_tx_delay_ms": 250,
+            "max_backoff_ms": 8000
+          }
+          JSON
+          # expand env vars inside JSON
+          sed -i "s|\${HELIUS1}|${HELIUS1}|g; s|\${HELIUS2}|${HELIUS2}|g" config.july.json
+          echo "Wrote config.july.json:"
+          cat config.july.json | sed 's/api-key=[A-Za-z0-9-]*/api-key=****/g'
+
+      - name: Run fetch_top_wallets_july.js
+        run: node fetch_top_wallets_july.js
+
+      - name: Summarize results (if present)
+        if: always()
+        shell: bash
+        run: |
+          echo "=== Files in data/ ==="
+          ls -lh data || true
+          echo
+          echo "=== Top wallets preview ==="
+          if [ -f data/top_wallets_july.csv ]; then
+            head -n 20 data/top_wallets_july.csv
+          else
+            echo "No top_wallets_july.csv produced."
+          fi
+
+      - name: Upload artifact (all outputs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: top-wallets-july-results
+          path: |
+            data/*.json
+            data/*.jsonl
+            data/*.csv
+          if-no-files-found: warn
+        
