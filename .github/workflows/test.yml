@@ -1,0 +1,427 @@
+---
+name: Run Surfpool Tests (July 2025)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/test.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: surfpool-test
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test-surfpool:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # allow up to 6 hours total per matrix run
+    strategy:
+      fail-fast: false
+      matrix:
+        window:
+          - { name: "2025-07-01_to_2025-07-15", start: "2025-07-01T00:00:00Z", end: "2025-07-15T23:59:59Z" }
+          - { name: "2025-07-16_to_2025-07-31", start: "2025-07-16T00:00:00Z", end: "2025-07-31T23:59:59Z" }
+
+    env:
+      # RPC rotation (your two Helius URLs) — Option B with your keys
+      HELIUS_RPC_URLS_JSON: >-
+        ["https://mainnet.helius-rpc.com/?api-key=6247588e-7f58-483f-bf97-e59ee1fcad37",
+         "https://mainnet.helius-rpc.com/?api-key=02a76c9f-34e8-4acf-bf36-c2b10b2a7fe2"]
+
+      # Token constants
+      USDC_MINT: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      JUP_ROUTER: "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB"
+
+      # Filters (USD) — MCAP via supply*median(px), LIQ via p90 swap size (USDC), VOL via sum of USDC
+      MIN_MARKET_CAP: "50000"
+      MAX_MARKET_CAP: "60000"
+      MIN_LIQUIDITY: "10000"
+      MAX_LIQUIDITY: "2000000"
+      MIN_VOLUME: "10000"
+      MAX_VOLUME: "200000"
+
+      # Strategy
+      SLIPPAGE_BPS: "500"      # 5%
+      TAKE_PROFIT_PCT: "3.0"   # 300%
+      STOP_LOSS_PCT: "0.2"     # 20%
+      TRADE_SIZE_USD: "100"
+
+      # Matrix-provided window (assigned in "env" per job below)
+      JULY_START_UTC: ${{ matrix.window.start }}
+      JULY_END_UTC:   ${{ matrix.window.end }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Optional: confirm keys are present without leaking them
+      - name: Debug Helius URLs (safe)
+        shell: bash
+        run: |
+          node -e '
+            const r=process.env.HELIUS_RPC_URLS_JSON||"";
+            console.log("HELIUS_RPC_URLS_JSON length:", r.length);
+            try {
+              const arr = JSON.parse(r);
+              const lens = arr.map(u => {
+                const m = /[?&]api-key=([^&"]*)/.exec(String(u));
+                return m && m[1] ? m[1].length : 0;
+              });
+              console.log("api-key lengths:", lens);
+            } catch(e) {
+              console.error("JSON parse error:", e.message); process.exit(1);
+            }
+          '
+
+      - name: Run backtest (fetch → on-chain stats → filter → PnL)
+        shell: bash
+        timeout-minutes: 330   # lower than job timeout so upload step still runs
+        run: |
+          set -Eeuo pipefail
+          mkdir -p data out
+
+          cat > run_backtest.js <<'JS'
+          const fs = require('fs');
+          const https = require('https');
+          const { URL } = require('url');
+
+          const USDC = process.env.USDC_MINT;
+          const JUP  = process.env.JUP_ROUTER;
+          const START = Math.floor(new Date(process.env.JULY_START_UTC).getTime()/1000);
+          const END   = Math.floor(new Date(process.env.JULY_END_UTC).getTime()/1000);
+
+          const F = {
+            MIN_MCAP: Number(process.env.MIN_MARKET_CAP),
+            MAX_MCAP: Number(process.env.MAX_MARKET_CAP),
+            MIN_LIQ:  Number(process.env.MIN_LIQUIDITY),
+            MAX_LIQ:  Number(process.env.MAX_LIQUIDITY),
+            MIN_VOL:  Number(process.env.MIN_VOLUME),
+            MAX_VOL:  Number(process.env.MAX_VOLUME),
+            SLIP_BPS: Number(process.env.SLIPPAGE_BPS),
+            TP: Number(process.env.TAKE_PROFIT_PCT),
+            SL: Number(process.env.STOP_LOSS_PCT),
+            NOTIONAL: Number(process.env.TRADE_SIZE_USD),
+          };
+
+          const RPCS = JSON.parse(process.env.HELIUS_RPC_URLS_JSON || '[]');
+          if (!Array.isArray(RPCS) || RPCS.length === 0) {
+            console.error('HELIUS_RPC_URLS_JSON is empty or invalid.');
+            process.exit(1);
+          }
+          let rpcIdx = 0;
+          const nextRpcUrl = () => RPCS[rpcIdx++ % RPCS.length];
+
+          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+          async function backoff(fn, tries=6){ let d=500;
+            for (let i=0;i<tries;i++){ try { return await fn(); } catch(e){ if(i===tries-1) throw e; await sleep(d); d=Math.min(d*2, 8000); } }
+          }
+
+          function httpRequest(opts, bodyStr){
+            return new Promise((resolve,reject)=>{
+              const req = https.request(opts, res=>{
+                let b=''; res.on('data',c=>b+=c); res.on('end',()=>{
+                  const out = { statusCode: res.statusCode, body: b };
+                  if ((res.statusCode||0) >= 400) {
+                    return reject(Object.assign(new Error(`HTTP ${res.statusCode}: ${b || '<empty>'}`), out));
+                  }
+                  try { resolve({ ...out, json: b ? JSON.parse(b) : null }); } catch(e){ reject(Object.assign(e, out)); }
+                });
+              });
+              req.on('error', reject);
+              if (bodyStr) req.write(bodyStr);
+              req.end();
+            });
+          }
+
+          function postJSON(urlStr, bodyObj){
+            const u = new URL(urlStr);
+            const body = JSON.stringify(bodyObj);
+            return httpRequest({
+              hostname: u.hostname,
+              path: u.pathname + u.search,
+              protocol: u.protocol,
+              method: 'POST',
+              headers: { 'Content-Type':'application/json', 'Content-Length': Buffer.byteLength(body) }
+            }, body).then(r => r.json);
+          }
+          function getJSON(urlStr){
+            const u = new URL(urlStr);
+            return httpRequest({
+              hostname: u.hostname,
+              path: u.pathname + u.search,
+              protocol: u.protocol,
+              method: 'GET'
+            }).then(r => r.json);
+          }
+
+          async function fetchJupiterSigsJuly(){
+            let out=[], before=null, fetched=0;
+            for(;;){
+              const rpcUrl = nextRpcUrl();
+              const params = before ? [JUP, {limit:1000, before}] : [JUP, {limit:1000}];
+              const resp = await backoff(()=>postJSON(rpcUrl, {jsonrpc:'2.0', id:1, method:'getSignaturesForAddress', params}), 6);
+              const arr = resp.result || [];
+              if (!arr.length) break;
+              let keep = true;
+              for (const x of arr){
+                const t = x.blockTime|0; if(!t) continue;
+                if (t < START){ keep = false; break; }
+                if (t <= END) out.push({signature:x.signature, blockTime:t});
+              }
+              fetched += arr.length;
+              if ((fetched % 5000) === 0) console.log(`[${new Date().toISOString()}] sigs fetched (raw pages): ${fetched}`);
+              if (!keep) break;
+              before = arr[arr.length-1] && arr[arr.length-1].signature;
+              if (!before) break;
+              await sleep(150);
+            }
+            out.sort((a,b)=>(a.blockTime||0)-(b.blockTime||0));
+            console.log(`[${new Date().toISOString()}] sigs in window: ${out.length}`);
+            return out;
+          }
+
+          function extractAnyHeliusApiKey(rpcs){
+            for (const u of rpcs) { try {
+              const key = new URL(u).searchParams.get('api-key');
+              if (key) return key;
+            } catch {} }
+            return '';
+          }
+          const HELIUS_KEY = extractAnyHeliusApiKey(RPCS);
+          if (!HELIUS_KEY) {
+            console.error('No Helius api-key found in HELIUS_RPC_URLS_JSON URLs.');
+            process.exit(1);
+          }
+
+          async function heliusEnhancedFetch(sigs){
+            const base = `https://api.helius.xyz/v0/transactions/?api-key=${HELIUS_KEY}`;
+            try { return await backoff(()=>postJSON(base, { transactions: sigs }), 3); }
+            catch (e1) {
+              try { return await backoff(()=>postJSON(base, { ids: sigs }), 3); }
+              catch (e2) {
+                try {
+                  const qs = sigs.map(s=>`transactions=${encodeURIComponent(s)}`).join('&');
+                  return await backoff(()=>getJSON(`${base}&${qs}`), 3);
+                } catch (e3) {
+                  const qs = sigs.map(s=>`txs[]=${encodeURIComponent(s)}`).join('&');
+                  const err = new Error(`All Helius Enhanced formats failed. Last URL: ${base}&${qs}\nFirst: ${e1}\nSecond: ${e2}\nThird: ${e3}`);
+                  err.code = 'HELIUS_FORMATS_FAILED';
+                  throw err;
+                }
+              }
+            }
+          }
+
+          async function fetchAllTxs(sigs){
+            const out=[];
+            let chunkSize = 10;
+            let i=0;
+            const total = sigs.length;
+            const startTs = Date.now();
+            while(i<sigs.length){
+              const chunk = sigs.slice(i, i+chunkSize);
+              try {
+                const data = await heliusEnhancedFetch(chunk.map(x=>x.signature));
+                if (!Array.isArray(data)) throw new Error(`Enhanced API returned non-array payload: ${JSON.stringify(data).slice(0,300)}...`);
+                out.push(...data);
+                i += chunk.length;
+                if (i % 100 === 0 || i === total) {
+                  const mins = ((Date.now()-startTs)/60000).toFixed(1);
+                  console.log(`[${new Date().toISOString()}] enhanced progress ${i}/${total} (${(i/total*100).toFixed(1)}%) elapsed ${mins}m`);
+                }
+                await sleep(600);
+              } catch (e) {
+                const msg = String(e && e.message || e);
+                if (chunk.length > 1 && (msg.includes('HTTP 400') || msg.includes('429') || (e && e.code === 'HELIUS_FORMATS_FAILED'))) {
+                  chunkSize = Math.max(1, Math.floor(chunkSize/2));
+                  console.log(`[${new Date().toISOString()}] throttled/400; reducing chunkSize to ${chunkSize}`);
+                  await sleep(1000);
+                  continue;
+                }
+                console.error(`Enhanced fetch failed at index ${i} (chunkSize=${chunkSize}). Error: ${msg}`);
+                throw e;
+              }
+            }
+            return out;
+          }
+
+          function extractMintsAndSeries(txs){
+            const seriesMap = new Map();
+            const volUsd = new Map();
+            for (const tx of txs){
+              const T = tx?.timestamp; if(!T) continue;
+              const tt = tx?.tokenTransfers; if(!Array.isArray(tt)) continue;
+              const usdc = tt.find(z=>z.mint===USDC);
+              const other= tt.find(z=>z.mint && z.mint!==USDC);
+              if(!usdc||!other) continue;
+
+              const usdcAmt = Math.abs(Number(usdc.tokenAmount||0));
+              const otherAmt= Math.abs(Number(other.tokenAmount||0));
+              if(!usdcAmt||!otherAmt) continue;
+
+              const px = usdcAmt/otherAmt;
+              const arr = seriesMap.get(other.mint) || [];
+              arr.push({t:T, px, usd:usdcAmt});
+              seriesMap.set(other.mint, arr);
+
+              volUsd.set(other.mint, (volUsd.get(other.mint)||0)+usdcAmt);
+            }
+            for(const [k,v] of seriesMap) v.sort((a,b)=>a.t-b.t);
+            return {seriesMap, volUsd};
+          }
+
+          function median(arr){ if (!arr.length) return 0; const s=[...arr].sort((a,b)=>a-b); const m=Math.floor(s.length/2); return s.length%2?s[m]:(s[m-1]+s[m])/2; }
+          function p90(arr){ if (!arr.length) return 0; const s=[...arr].sort((a,b)=>a-b); const idx=Math.floor(0.9*(s.length-1)); return s[idx]; }
+
+          async function rpcCall(method, params){
+            const url = nextRpcUrl();
+            const body = {jsonrpc:'2.0', id:1, method, params};
+            const resp = await backoff(()=>postJSON(url, body), 6);
+            if (resp.error) throw new Error(JSON.stringify(resp.error));
+            return resp.result;
+          }
+          async function getSupplyForMints(mints){
+            const entries = Array.from(mints);
+            const out = new Map();
+            const LIMIT = 5; let i=0, active=0;
+            return await new Promise((resolve,reject)=>{
+              function next(){
+                while(active<LIMIT && i<entries.length){
+                  const mint = entries[i++]; active++;
+                  rpcCall('getTokenSupply', [mint]).then(r=>{
+                    const v = r && r.value;
+                    const dec = v?.decimals ?? 0;
+                    const raw = Number(v?.amount || '0');
+                    const supply = dec ? raw / (10**dec) : raw;
+                    out.set(mint, Number.isFinite(supply)? supply : 0);
+                  }).catch(_=>{
+                    out.set(mint, 0);
+                  }).finally(()=>{
+                    active--;
+                    if (i>=entries.length && active===0) resolve(out); else next();
+                  });
+                }
+              }
+              next();
+            });
+          }
+
+          function buildStatsAndFilter(seriesMap, volUsd, supplyMap, F){
+            const allow = new Set();
+            const snapshot = [];
+            for (const [mint, arr] of seriesMap){
+              const pxs = arr.map(x=>x.px);
+              const medPx = median(pxs);
+              const sizes = arr.map(x=>x.usd);
+              const p90Size = p90(sizes);
+
+              const supply = supplyMap.get(mint) || 0;
+              const mcap = medPx * supply;
+              const vol = volUsd.get(mint) || 0;
+
+              const pass =
+                mcap >= F.MIN_MCAP && mcap <= F.MAX_MCAP &&
+                p90Size >= F.MIN_LIQ && p90Size <= F.MAX_LIQ &&
+                vol >= F.MIN_VOL && vol <= F.MAX_VOL;
+
+              if (pass) allow.add(mint);
+              snapshot.push({mint, mcap: Number(mcap.toFixed(2)), liquidity_proxy_p90_usdc: Number(p90Size.toFixed(2)), volume_usd: Number(vol.toFixed(2)), pass});
+            }
+            return {allow, snapshot};
+          }
+
+          function runBacktest(seriesMap, allow, F){
+            const trades=[];
+            const slip = F.SLIP_BPS/10000;
+            for(const [mint, series] of seriesMap){
+              if(!allow.has(mint)) continue;
+              if(series.length<2) continue;
+              const entryPx=series[0].px;
+              const qty=F.NOTIONAL/entryPx;
+              let exit=series[series.length-1], reason='EOD';
+              for(let i=1;i<series.length;i++){
+                const r=(series[i].px-entryPx)/entryPx;
+                if(r>=F.TP){ exit=series[i]; reason='TP'; break; }
+                if(r<=-F.SL){ exit=series[i]; reason='SL'; break; }
+              }
+              const buyPx  = entryPx*(1+slip);
+              const sellPx = exit.px*(1-slip);
+              const pnlUSD = (sellPx - buyPx)*qty;
+              trades.push({mint, entry_t:series[0].t, entry_px:entryPx, exit_t:exit.t, exit_px:exit.px, reason, qty, pnl_usd:pnlUSD});
+            }
+            return trades;
+          }
+
+          (async ()=>{
+            console.log(`Window: ${process.env.JULY_START_UTC} -> ${process.env.JULY_END_UTC}`);
+            console.log('Step 1: Fetching July Jupiter signatures…');
+            const sigs = await fetchJupiterSigsJuly();
+            if(!sigs.length){
+              fs.writeFileSync('out/summary.json', JSON.stringify({trade_count:0, wins:0, win_rate_pct:0, total_revenue_usd:0}, null, 2));
+              console.log('No signatures in window. Exiting clean.');
+              process.exit(0);
+            }
+            fs.writeFileSync('data/surfpool-replay.json', JSON.stringify(sigs,null,2));
+            console.log('Signatures:', sigs.length);
+
+            console.log('Step 2: Fetching Helius Enhanced txs…');
+            const txs = await fetchAllTxs(sigs);
+
+            console.log('Step 3: Building price series & volume…');
+            const {seriesMap, volUsd} = extractMintsAndSeries(txs);
+            const mints = Array.from(seriesMap.keys());
+            console.log('Mints with USDC swaps:', mints.length);
+
+            console.log('Step 4: Fetching on-chain token supply…');
+            const supplyMap = await getSupplyForMints(mints);
+
+            console.log('Step 5: Computing stats & applying filters…');
+            const {allow, snapshot} = buildStatsAndFilter(seriesMap, volUsd, supplyMap, F);
+            console.log('Allowed mints:', allow.size);
+
+            console.log('Step 6: Backtesting TP/SL…');
+            const trades = runBacktest(seriesMap, allow, F);
+
+            const wins = trades.filter(t=>t.pnl_usd>0).length;
+            const winRate = trades.length ? (wins/trades.length*100) : 0;
+            const totalPNL = trades.reduce((a,b)=>a+b.pnl_usd,0);
+
+            if(!fs.existsSync('out')) fs.mkdirSync('out',{recursive:true});
+            fs.writeFileSync('out/token_filter_snapshot.json', JSON.stringify(snapshot,null,2));
+            fs.writeFileSync('out/trades.csv',
+              'mint,entry_t,entry_px,exit_t,exit_px,reason,qty,pnl_usd\n' +
+              trades.map(t=>[t.mint,t.entry_t,t.entry_px,t.exit_t,t.exit_px,t.reason||'',t.qty,t.pnl_usd].join(',')).join('\n'));
+            fs.writeFileSync('out/summary.json', JSON.stringify({
+              window:{start:process.env.JULY_START_UTC, end:process.env.JULY_END_UTC},
+              filters:F,
+              trade_count: trades.length,
+              wins,
+              win_rate_pct: Number(winRate.toFixed(2)),
+              total_revenue_usd: Number(totalPNL.toFixed(2))
+            }, null, 2));
+
+            console.log(`DONE -> Trades=${trades.length} Wins=${wins} WinRate=${winRate.toFixed(2)}% TotalRevenueUSD=${totalPNL.toFixed(2)}`);
+          })().catch(e=>{ console.error(e); process.exit(1); });
+          JS
+
+          # Run and tee to a file so we can always retrieve logs
+          node run_backtest.js 2>&1 | tee out/run.log
+
+      - name: Upload logs and results (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surfpool-results-${{ matrix.window.name }}
+          path: |
+            out/
+            data/. 
+

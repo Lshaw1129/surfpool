@@ -1,0 +1,19 @@
+name: build-surfpool
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (release)
+        run: cargo build --release --locked
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: surfpool-linux-amd64
+          path: target/release/surfpool
+
