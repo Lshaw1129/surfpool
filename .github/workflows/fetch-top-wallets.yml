@@ -24,7 +24,24 @@ jobs:
           node-version: 20
           check-latest: true
 
-      # No npm install step (there is no package.json/lockfile)
+      - name: Sanity checks (script & secrets)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Script must exist
+          if [ ! -f "surfpool-backtest/fetch_top_wallets_july.js" ]; then
+            echo "ERROR: Missing script at surfpool-backtest/fetch_top_wallets_july.js"
+            echo "       (Update the workflow run path or commit the script.)"
+            exit 1
+          fi
+          # Secrets must be present
+          if [ -z "${{ secrets.HELIUS_API_KEY_1 }}" ] || [ -z "${{ secrets.HELIUS_API_KEY_2 }}" ]; then
+            echo "ERROR: Missing secrets HELIUS_API_KEY_1 and/or HELIUS_API_KEY_2."
+            echo "       Add them in: Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          node -v
+          echo "Sanity checks passed."
 
       - name: Create config.july.json from secrets
         shell: bash
@@ -48,16 +65,20 @@ jobs:
             "max_backoff_ms": 8000
           }
           JSON
-          # expand env vars inside JSON
+          # Expand env vars inside JSON
           sed -i "s|\${HELIUS1}|${HELIUS1}|g; s|\${HELIUS2}|${HELIUS2}|g" config.july.json
-          echo "Wrote config.july.json (api keys masked):"
+          echo "Wrote config.july.json (masked keys below):"
           sed 's/api-key=[A-Za-z0-9-]*/api-key=****/g' config.july.json
 
       - name: Run fetch_top_wallets_july.js
         shell: bash
+        timeout-minutes: 330
         run: |
           set -Eeuo pipefail
-          node fetch_top_wallets_july.js
+          # Ensure data dir exists for outputs
+          mkdir -p data
+          # Run from repo root; script should write to ./data/
+          node surfpool-backtest/fetch_top_wallets_july.js 2>&1 | tee data/run.log
 
       - name: Summarize results (if present)
         if: always()
@@ -66,11 +87,18 @@ jobs:
           echo "=== Files in ./data ==="
           ls -lh data || true
           echo
-          echo "=== Top wallets preview ==="
+          echo "=== Top wallets preview (first 20) ==="
           if [ -f data/top_wallets_july.csv ]; then
             head -n 20 data/top_wallets_july.csv
           else
             echo "No top_wallets_july.csv produced."
+          fi
+          echo
+          echo "=== Summary (if any) ==="
+          if [ -f data/summary.json ]; then
+            cat data/summary.json
+          else
+            echo "No summary.json found."
           fi
 
       - name: Upload artifact (all outputs)
@@ -80,5 +108,7 @@ jobs:
           name: top-wallets-july-results
           path: |
             data/**
+            config.july.json
           if-no-files-found: warn
+          retention-days: 14
 
