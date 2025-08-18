@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # hard cap; your script also has its own max_minutes
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repo
@@ -22,9 +22,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          check-latest: true
 
-      - name: Install deps (if any)
-        run: npm ci || npm install
+      # No npm install step (there is no package.json/lockfile)
 
       - name: Create config.july.json from secrets
         shell: bash
@@ -32,6 +32,7 @@ jobs:
           HELIUS1: ${{ secrets.HELIUS_API_KEY_1 }}
           HELIUS2: ${{ secrets.HELIUS_API_KEY_2 }}
         run: |
+          set -Eeuo pipefail
           mkdir -p data
           cat > config.july.json <<'JSON'
           {
@@ -49,17 +50,20 @@ jobs:
           JSON
           # expand env vars inside JSON
           sed -i "s|\${HELIUS1}|${HELIUS1}|g; s|\${HELIUS2}|${HELIUS2}|g" config.july.json
-          echo "Wrote config.july.json:"
-          cat config.july.json | sed 's/api-key=[A-Za-z0-9-]*/api-key=****/g'
+          echo "Wrote config.july.json (api keys masked):"
+          sed 's/api-key=[A-Za-z0-9-]*/api-key=****/g' config.july.json
 
       - name: Run fetch_top_wallets_july.js
-        run: node fetch_top_wallets_july.js
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node fetch_top_wallets_july.js
 
       - name: Summarize results (if present)
         if: always()
         shell: bash
         run: |
-          echo "=== Files in data/ ==="
+          echo "=== Files in ./data ==="
           ls -lh data || true
           echo
           echo "=== Top wallets preview ==="
@@ -75,8 +79,6 @@ jobs:
         with:
           name: top-wallets-july-results
           path: |
-            data/*.json
-            data/*.jsonl
-            data/*.csv
+            data/**
           if-no-files-found: warn
-        
+
